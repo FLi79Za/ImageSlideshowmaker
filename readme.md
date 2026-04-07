@@ -212,15 +212,14 @@ The app automatically:
 
 
 
-\## 📄 License
+## 📄 License
 
+This project is licensed under the MIT License.
 
+Copyright (c) 2026 Francois Linde
 
-You can add a license (e.g. MIT) if you plan to share this publicly.
+You are free to use, modify, and distribute this software for personal or commercial purposes, provided that the original license is included.
 
-
-
----
 
 
 
