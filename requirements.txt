@@ -1,3 +1,4 @@
 Pillow
 numpy
 imageio-ffmpeg
+pyside6
