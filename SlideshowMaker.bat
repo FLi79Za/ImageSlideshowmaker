@@ -1,5 +1,5 @@
 @Echo off
 title Slideshow Maker
 call env\scripts\activate
-python slideshow_maker.py
+python slideshow_maker_pyside.py
 pause

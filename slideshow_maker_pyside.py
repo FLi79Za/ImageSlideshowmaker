@@ -21,7 +21,7 @@ from PIL.ImageQt import ImageQt
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QSignalBlocker, Qt, QThread, Signal, QSize
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -711,6 +711,23 @@ class SlideshowExporter:
         ]
         self.run_ffmpeg(cmd, "Muxing video and audio")
 
+    def calculate_hold_seconds_for_manual_list(self) -> float:
+        s = self.settings
+        n = len(self.image_paths)
+        if n <= 0:
+            raise RuntimeError("No images were provided for export.")
+
+        hold = (s.target_duration - max(0, n - 1) * s.transition_seconds) / max(1, n)
+        if hold <= 0:
+            raise RuntimeError("Target duration is too short for this many images and the current transition length.")
+        if hold < s.min_hold_seconds:
+            raise RuntimeError(
+                f"The visible image list needs {hold:.2f}s per image, which is below the minimum hold value of "
+                f"{s.min_hold_seconds:.2f}s. Remove some images, reduce the transition length, reduce the minimum hold, "
+                "or increase the target duration."
+            )
+        return hold
+
     def export(self) -> None:
         out_path = self.settings.output_path
         os.makedirs(str(Path(out_path).resolve().parent), exist_ok=True)
@@ -718,9 +735,10 @@ class SlideshowExporter:
         temp_video = str(Path(out_path).with_suffix(".video_only_temp.mp4"))
         temp_audio = str(Path(out_path).with_suffix(".audio_temp.m4a"))
 
-        self.progress(0.01, "Analysing images")
-        candidates = self.analyse_images()
-        selected_paths, hold_seconds = self.choose_images_to_fit(candidates)
+        selected_paths = self.image_paths.copy()
+        hold_seconds = self.calculate_hold_seconds_for_manual_list()
+        self.log(f"Using {len(selected_paths)} image(s) exactly as shown in the review list.")
+        self.log(f"Computed hold time per image: {hold_seconds:.2f}s")
 
         self.progress(0.22, "Rendering video")
         actual_duration = self.render_video_only(selected_paths, hold_seconds, temp_video)
@@ -826,6 +844,12 @@ class App(QMainWindow):
         self.btn_remove_images = QPushButton("Remove Selected")
         self.btn_remove_images.clicked.connect(self.remove_selected_images)
         top_row.addWidget(self.btn_remove_images)
+        self.btn_replace_images = QPushButton("Replace Selected")
+        self.btn_replace_images.clicked.connect(self.replace_selected_images)
+        top_row.addWidget(self.btn_replace_images)
+        self.btn_auto_pick = QPushButton("Auto Pick to Fit")
+        self.btn_auto_pick.clicked.connect(self.auto_pick_images_to_fit)
+        top_row.addWidget(self.btn_auto_pick)
         self.btn_clear_images = QPushButton("Clear")
         self.btn_clear_images.clicked.connect(self.clear_images)
         top_row.addWidget(self.btn_clear_images)
@@ -837,11 +861,18 @@ class App(QMainWindow):
         self.recursive_images_check.toggled.connect(self.update_summary)
         img_layout.addWidget(self.recursive_images_check)
 
+        self.export_visible_list_check = QCheckBox("Export the visible review list exactly as shown")
+        self.export_visible_list_check.setChecked(True)
+        self.export_visible_list_check.setToolTip("The slideshow will use the images currently listed below, in this order. Use Auto Pick to Fit if you want the app to create a shorter scored list first.")
+        self.export_visible_list_check.setEnabled(False)
+        img_layout.addWidget(self.export_visible_list_check)
+
         splitter = QSplitter(Qt.Horizontal)
         list_group = QGroupBox("Image Order")
         list_layout = QVBoxLayout(list_group)
         self.image_list = QListWidget()
         self.image_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.image_list.setIconSize(QSize(72, 72))
         self.image_list.currentRowChanged.connect(self.on_select_preview)
         list_layout.addWidget(self.image_list)
 
@@ -852,6 +883,9 @@ class App(QMainWindow):
         self.btn_move_down = QPushButton("Move Down")
         self.btn_move_down.clicked.connect(self.move_down)
         order_row.addWidget(self.btn_move_down)
+        self.btn_select_all_images = QPushButton("Select All")
+        self.btn_select_all_images.clicked.connect(self.image_list.selectAll)
+        order_row.addWidget(self.btn_select_all_images)
         order_row.addStretch(1)
         list_layout.addLayout(order_row)
 
@@ -1059,10 +1093,10 @@ class App(QMainWindow):
         fps = int(self.fps_combo.currentData() or int(self.fps_combo.currentText()))
         audio_text = f"Tracks: {len(self.audio_paths)} | Mode: {self.audio_mode_combo.currentText()}"
         self.summary_label.setText(
-            f"Images loaded: {n}\n"
+            f"Images in review list: {n}\n"
             f"Target length: {seconds_to_hms(total)}\n"
             f"Max images that fit at current minimum hold: {max_fit}\n"
-            f"Estimated dropped by scorer: {will_drop}\n"
+            f"Images to remove or auto-pick around: {will_drop}\n"
             f"Resolution: {self.resolution_combo.currentText()} @ {fps}fps\n"
             f"{audio_text}\n"
             f"Image folder recursion: {'On' if self.recursive_images_check.isChecked() else 'Off'}"
@@ -1096,6 +1130,59 @@ class App(QMainWindow):
             del self.image_paths[idx]
         self.refresh_image_list()
 
+    def replace_selected_images(self) -> None:
+        indices = self._selected_rows(self.image_list)
+        if not indices:
+            QMessageBox.information(self, "No selection", "Select one or more images in the review list first.")
+            return
+
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose replacement image(s)",
+            str(Path(self.image_paths[indices[0]]).parent) if self.image_paths else "",
+            "Images (*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff)",
+        )
+        if not files:
+            return
+
+        insert_at = indices[0]
+        for idx in reversed(indices):
+            del self.image_paths[idx]
+
+        unique_files = [f for f in files if f not in self.image_paths]
+        for offset, f in enumerate(unique_files):
+            self.image_paths.insert(insert_at + offset, f)
+
+        self.refresh_image_list(list(range(insert_at, insert_at + len(unique_files))))
+
+    def auto_pick_images_to_fit(self) -> None:
+        if not self.image_paths:
+            QMessageBox.warning(self, "No images", "Add images first, then use Auto Pick to Fit.")
+            return
+        try:
+            settings = self.collect_settings()
+            exporter = SlideshowExporter(
+                image_paths=self.image_paths.copy(),
+                settings=settings,
+                progress_cb=lambda value, status: self.set_progress(value, status),
+                log_cb=lambda msg: self.log(msg),
+            )
+            self.status_label.setText("Auto-picking images...")
+            candidates = exporter.analyse_images()
+            chosen, hold = exporter.choose_images_to_fit(candidates)
+            self.image_paths = chosen
+            self.refresh_image_list([0] if chosen else None)
+            self.set_progress(0.0, "Idle")
+            QMessageBox.information(
+                self,
+                "Auto pick complete",
+                f"Selected {len(chosen)} image(s). Estimated hold time: {hold:.2f}s per image.\n\n"
+                "You can still remove, reorder, or replace images before exporting.",
+            )
+        except Exception as exc:
+            self.set_progress(0.0, "Idle")
+            QMessageBox.critical(self, "Auto pick failed", str(exc))
+
     def clear_images(self) -> None:
         self.image_paths.clear()
         self.refresh_image_list()
@@ -1121,8 +1208,16 @@ class App(QMainWindow):
 
     def refresh_image_list(self, select_indices: Optional[List[int]] = None) -> None:
         self.image_list.clear()
-        for p in self.image_paths:
-            self.image_list.addItem(QListWidgetItem(Path(p).name))
+        for idx, p in enumerate(self.image_paths, start=1):
+            item = QListWidgetItem(f"{idx:03d}. {Path(p).name}")
+            item.setToolTip(p)
+            try:
+                img = load_and_normalise_image(p)
+                img.thumbnail((96, 96), Image.Resampling.LANCZOS)
+                item.setIcon(pil_to_qpixmap(img))
+            except Exception:
+                pass
+            self.image_list.addItem(item)
         if select_indices:
             with QSignalBlocker(self.image_list.selectionModel()):
                 for i in select_indices:
@@ -1242,7 +1337,7 @@ class App(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         widgets = [
             self.btn_add_images, self.btn_add_folder, self.btn_remove_images, self.btn_clear_images,
-            self.btn_move_up, self.btn_move_down, self.btn_add_tracks, self.btn_add_audio_folder,
+            self.btn_move_up, self.btn_move_down, self.btn_select_all_images, self.btn_replace_images, self.btn_auto_pick, self.btn_add_tracks, self.btn_add_audio_folder,
             self.btn_remove_audio, self.btn_clear_audio, self.btn_browse_output, self.export_button,
             self.recursive_images_check, self.recursive_audio_check, self.image_list, self.audio_list,
             self.resolution_combo, self.fps_combo, self.target_duration_spin, self.min_hold_spin,
